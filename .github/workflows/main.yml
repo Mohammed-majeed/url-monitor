@@ -1,0 +1,38 @@
+name: URL Monitor External Checks
+
+on:
+  repository_dispatch:
+    types: [url-monitor-check]
+
+permissions:
+  contents: read
+
+jobs:
+  external-url-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run external URL checks
+        run: |
+          printf '%s' "$TARGETS_JSON" | python -m modules.external_url_monitor --targets-stdin
+        env:
+          TARGETS_JSON: ${{ toJson(github.event.client_payload.targets) }}
+
+      - name: Upload external URL monitor logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: url-monitor-logs
+          path: External_url_logs/
+          if-no-files-found: error
