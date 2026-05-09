@@ -35,6 +35,7 @@ def run_internal(
     verify_ssl: bool = False,
     application: str = "URLMonitor",
     action: str = "url_monitor",
+    user_agent: str = "URLMonitor",
 ) -> List[CheckResult]:
     """
     Check the given targets in parallel and write a single JSON-lines log
@@ -54,6 +55,7 @@ def run_internal(
             verify_ssl=verify_ssl,
             application=application,
             action=action,
+            user_agent=user_agent,
         )
 
     results: List[CheckResult] = []
@@ -82,6 +84,9 @@ def _main():
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--verify-ssl", action="store_true")
+    parser.add_argument("--application", default="URLMonitor")
+    parser.add_argument("--action", default="url_monitor")
+    parser.add_argument("--user-agent", default="URLMonitor")
     parser.add_argument("--proxy", default="",
                         help="Optional proxy URL. Only applied to targets with use_proxy=True.")
     args = parser.parse_args()
@@ -107,6 +112,9 @@ def _main():
         concurrency=args.concurrency,
         proxies=proxies,
         verify_ssl=args.verify_ssl,
+        application=args.application,
+        action=args.action,
+        user_agent=args.user_agent,
     )
     print_summary(results)
 
