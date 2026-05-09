@@ -108,6 +108,15 @@ def _normalize_url(raw: str) -> str:
     return u
 
 
+def _strip_url_scheme(url: str) -> str:
+    u = (url or "").strip()
+    if u.startswith("https://"):
+        return u[len("https://"):]
+    if u.startswith("http://"):
+        return u[len("http://"):]
+    return u
+
+
 def _status_category(code: int) -> str:
     if 200 <= code < 300: return "success"
     if 300 <= code < 400: return "redirect"
@@ -241,6 +250,8 @@ def check_one(
     """
     started = _now()
     checked_url = _normalize_url(target.url)
+    log_url = _strip_url_scheme(target.url)
+    log_checked_url = _strip_url_scheme(checked_url)
 
     err_type: Optional[str] = None
     err_msg: str = ""
@@ -288,10 +299,12 @@ def check_one(
     if err_type is not None:
         category = "error"
         ok = False
+        log_final_url = _strip_url_scheme(final_url)
         msg = (
             f"{err_type}:{err_msg},"
-            f"url:{target.url},"
-            f"checked_url:{checked_url},"
+            f"url:{log_url},"
+            f"checked_url:{log_checked_url},"
+            f"final_url:{log_final_url},"
             f"env:{target.environment},"
             f"app:{target.app_name},"
             f"location:{target.location_type}"
@@ -301,12 +314,13 @@ def check_one(
         status_ok = spec.is_ok(status, login)
         text_ok = text_check in ("skipped", "passed")
         ok = status_ok and text_ok
+        log_final_url = _strip_url_scheme(final_url)
         msg = (
             f"status:{category},"
             f"http_code:{status},"
-            f"url:{target.url},"
-            f"checked_url:{checked_url},"
-            f"final_url:{final_url},"
+            f"url:{log_url},"
+            f"checked_url:{log_checked_url},"
+            f"final_url:{log_final_url},"
             f"looks_like_login:{str(login).lower()},"
             f"text_check:{text_check},"
             f"env:{target.environment},"
@@ -332,9 +346,9 @@ def check_one(
         location_type=target.location_type,
         app_name=target.app_name,
         runner=target.runner,
-        url=target.url,
-        checked_url=checked_url,
-        final_url=final_url,
+        url=log_url,
+        checked_url=log_checked_url,
+        final_url=log_final_url,
         http_code=status,
         status_category=category,
         looks_like_login=login,
