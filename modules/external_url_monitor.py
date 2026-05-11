@@ -69,6 +69,12 @@ def run_external(
     """
     Check the given targets in parallel from the external runner perspective.
     Writes a JSON-lines log file to `log_dir`.
+
+    NOTE: proxies is accepted as a parameter for API compatibility but is
+    intentionally ignored inside _do(). External targets are public URLs
+    reachable directly from GitHub Actions — the corporate proxy must never
+    be used here, regardless of what the caller passes or what use_proxy
+    is set to on the individual target.
     """
     force_timezone(timezone)
 
@@ -80,11 +86,14 @@ def run_external(
     log_path = make_log_path(log_dir)
 
     def _do(t: CheckTarget) -> CheckResult:
-        # On GitHub Actions there is normally no corporate proxy.
-        # Proxy is only used if explicitly passed and target.use_proxy=True.
+        # FIX: always pass proxies=None here.
+        # The GitHub Actions runner is outside the corporate network.
+        # The corporate proxy (webproxy.rws.nl) is unreachable from there.
+        # Passing proxies=None also triggers --noproxy * in the curl command,
+        # which prevents any environment proxy variables from leaking through.
         return check_one(
             t,
-            proxies=proxies,
+            proxies=None,       # ← never use corporate proxy on external runner
             verify_ssl=verify_ssl,
             application=application,
             action=action,
@@ -178,10 +187,13 @@ def _main() -> None:
     user_agent = settings.get("user_agent", args.user_agent)
     timezone = settings.get("external_timezone", args.timezone)
 
+    # NOTE: no proxy is ever passed here. The external runner (GitHub Actions)
+    # has no access to the corporate proxy.
     results = run_external(
         targets,
         log_dir=log_dir,
         concurrency=concurrency,
+        proxies=None,
         verify_ssl=verify_ssl,
         application=application,
         action=action,

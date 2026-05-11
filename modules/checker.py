@@ -214,11 +214,16 @@ def _do_request(url: str, *, timeout: int, verify: bool,
 
         if p.returncode != 0:
             err = (p.stderr or "").strip()
+            debug_cmd = " ".join(cmd)
+
             if p.returncode == 28:
-                raise Timeout(f"curl timeout: {err}")
+                raise Timeout(f"curl timeout rc=28: {err}; cmd={debug_cmd}")
             if p.returncode in (35, 51, 58, 60):
-                raise SSLError(f"curl SSL error {p.returncode}: {err}")
-            raise ReqConnectionError(f"curl failed rc={p.returncode}: {err}")
+                raise SSLError(f"curl SSL error rc={p.returncode}: {err}; cmd={debug_cmd}")
+
+            raise ReqConnectionError(
+                f"curl failed rc={p.returncode}: {err}; cmd={debug_cmd}"
+            )
 
         lines = [x.strip() for x in (p.stdout or "").splitlines() if x.strip()]
         if len(lines) >= 1:
@@ -254,46 +259,6 @@ def _do_request(url: str, *, timeout: int, verify: bool,
             except OSError:
                 body = ""
                 bytes_read = 0
-
-    return status, final_url, body, content_length, bytes_read, truncated
-
-    # Otherwise try HEAD first.
-    try:
-        r = session.head(
-            url,
-            headers=headers,
-            timeout=timeout,
-            verify=verify,
-            proxies=req_proxies,
-            allow_redirects=True,
-        )
-        status = r.status_code
-        final_url = r.url
-        content_length = _content_length_header(r)
-
-        if status not in (405, 501):
-            r.close()
-            return status, final_url, body, content_length, bytes_read, truncated
-
-        r.close()
-
-    except (Timeout, SSLError, ReqConnectionError, RequestException):
-        pass
-
-    # Fallback GET without body.
-    r = session.get(
-        url,
-        headers=headers,
-        timeout=timeout,
-        verify=verify,
-        proxies=req_proxies,
-        allow_redirects=True,
-        stream=False,
-    )
-    status = r.status_code
-    final_url = r.url
-    content_length = _content_length_header(r)
-    r.close()
 
     return status, final_url, body, content_length, bytes_read, truncated
 

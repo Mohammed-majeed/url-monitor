@@ -36,7 +36,10 @@ class InventoryDefaults:
     max_body_bytes: int = 200000
     timeout_seconds: int = 10
 
-    external_proxy: bool = True
+    # FIX: external_proxy default changed from True to False.
+    # External targets run on GitHub Actions which has no corporate proxy.
+    # Sending corporate proxy details to GitHub causes ProxyError.
+    external_proxy: bool = False
     internal_proxy: bool = False
     ingress_proxy: bool = False
 
