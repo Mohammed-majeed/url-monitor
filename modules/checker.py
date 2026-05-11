@@ -151,13 +151,18 @@ def _do_request(url: str, *, timeout: int, verify: bool,
                 proxies: Optional[dict], read_body: bool,
                 max_body_bytes: int, user_agent: str):
     """
-    Check URL and follow redirects.
+    Curl-based checker.
 
-    Important:
-    - If read_body=True, use GET directly. This matches `curl -L`.
-    - HEAD is only used for lightweight checks where body is not needed.
+    This follows redirects like:
+        curl -kL https://host/path
+
+    It is often more reliable in corporate/RWS environments than Python requests,
+    especially with proxy, SSL, Schannel/certificates, and redirect behaviour.
     """
-    headers = {"User-Agent": user_agent}
+    import os
+    import subprocess
+    import tempfile
+
     body = ""
     final_url = url
     status = 0
@@ -165,51 +170,92 @@ def _do_request(url: str, *, timeout: int, verify: bool,
     bytes_read = 0
     truncated = False
 
-    session = requests.Session()
-    session.trust_env = False
-    req_proxies = proxies or {}
+    with tempfile.TemporaryDirectory() as td:
+        body_path = os.path.join(td, "body.out")
+        header_path = os.path.join(td, "headers.out")
 
-    def _read_response_body(r):
-        chunks = []
-        total = 0
-        was_truncated = False
+        cmd = [
+            "curl",
+            "-sS",                 # silent, but still show errors
+            "-L",                  # follow redirects
+            "--connect-timeout", str(timeout),
+            "--max-time", str(max(timeout * 3, timeout + 15)),
+            "-A", user_agent,
+            "-D", header_path,     # response headers
+            "-o", body_path,       # response body
+            "-w", "%{http_code}\n%{url_effective}\n",
+        ]
 
-        for chunk in r.iter_content(chunk_size=8192, decode_unicode=False):
-            if not chunk:
-                continue
-            chunks.append(chunk)
-            total += len(chunk)
-            if total >= max_body_bytes:
-                was_truncated = True
-                break
+        # Match curl -k only when SSL verification is disabled.
+        if not verify:
+            cmd.append("-k")
 
-        raw = b"".join(chunks)[:max_body_bytes]
+        # Important:
+        # If proxies are explicitly passed, use them.
+        # If not, prevent hidden environment proxy from changing the result.
+        if proxies:
+            proxy_url = proxies.get("https") or proxies.get("http")
+            if proxy_url:
+                cmd.extend(["--proxy", proxy_url])
+        else:
+            cmd.extend(["--noproxy", "*"])
+
+        cmd.append(url)
+
         try:
-            enc = r.encoding or r.apparent_encoding or "utf-8"
-            text = raw.decode(enc, errors="replace")
-        except Exception:
-            text = raw.decode("utf-8", errors="replace")
+            p = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=max(timeout * 3 + 10, timeout + 20),
+            )
+        except subprocess.TimeoutExpired:
+            raise Timeout(f"curl timed out after {timeout}s")
 
-        return text, len(raw), was_truncated
+        if p.returncode != 0:
+            err = (p.stderr or "").strip()
+            if p.returncode == 28:
+                raise Timeout(f"curl timeout: {err}")
+            if p.returncode in (35, 51, 58, 60):
+                raise SSLError(f"curl SSL error {p.returncode}: {err}")
+            raise ReqConnectionError(f"curl failed rc={p.returncode}: {err}")
 
-    # If we need body or text validation, use GET directly.
-    # This follows /api -> /api/info.json exactly like curl -L.
-    if read_body:
-        r = session.get(
-            url,
-            headers=headers,
-            timeout=timeout,
-            verify=verify,
-            proxies=req_proxies,
-            allow_redirects=True,
-            stream=True,
-        )
-        status = r.status_code
-        final_url = r.url
-        content_length = _content_length_header(r)
-        body, bytes_read, truncated = _read_response_body(r)
-        r.close()
-        return status, final_url, body, content_length, bytes_read, truncated
+        lines = [x.strip() for x in (p.stdout or "").splitlines() if x.strip()]
+        if len(lines) >= 1:
+            try:
+                status = int(lines[-2] if len(lines) >= 2 else lines[-1])
+            except ValueError:
+                status = 0
+
+        if len(lines) >= 2:
+            final_url = lines[-1]
+
+        # Parse final Content-Length if available.
+        try:
+            with open(header_path, "r", encoding="utf-8", errors="replace") as hf:
+                for line in hf:
+                    if line.lower().startswith("content-length:"):
+                        try:
+                            content_length = int(line.split(":", 1)[1].strip())
+                        except ValueError:
+                            pass
+        except OSError:
+            content_length = -1
+
+        if read_body:
+            try:
+                with open(body_path, "rb") as bf:
+                    raw = bf.read(max_body_bytes + 1)
+                if len(raw) > max_body_bytes:
+                    truncated = True
+                    raw = raw[:max_body_bytes]
+                bytes_read = len(raw)
+                body = raw.decode("utf-8", errors="replace")
+            except OSError:
+                body = ""
+                bytes_read = 0
+
+    return status, final_url, body, content_length, bytes_read, truncated
 
     # Otherwise try HEAD first.
     try:
