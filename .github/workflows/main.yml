@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -22,13 +24,15 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run external URL checks
         run: |
           printf '%s' "$TARGETS_JSON" | python -m modules.external_url_monitor --targets-stdin
         env:
-          TARGETS_JSON: ${{ toJson(github.event.client_payload.targets) }}
+          TARGETS_JSON: ${{ toJson(github.event.client_payload) }}
 
       - name: Upload external URL monitor logs
         uses: actions/upload-artifact@v4
