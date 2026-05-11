@@ -11,16 +11,16 @@ Flow:
     3. Wait, fetch the GH artifact, extract logs
     4. Optionally delete the GH artifact
     5. Combine internal+external logs into one Splunk-ready file
+    6. Write optional per-URL detail log (separate from combined log)
 
 All operational parameters are controlled from url_monitor_config.ini.
-Command-line flags only override two common runtime choices: config path,
-GitHub dispatch on/off, and wait seconds.
 """
 from __future__ import annotations
 
 import configparser
 import dataclasses
 import json
+import logging
 import os
 import time
 import zipfile
@@ -37,7 +37,14 @@ from modules.inventory import (
     split_by_runner,
 )
 from modules.internal_url_monitor import run_internal
-from modules.log_writer import cleanup_old, print_summary
+from modules.log_writer import (
+    cleanup_old,
+    print_summary,
+    setup_logging,
+    write_detail_log,
+)
+
+logger = logging.getLogger("url_monitor.main")
 
 
 # ─── Config helpers ────────────────────────────────────────────────────────────
@@ -66,6 +73,8 @@ def _getstr(parser: configparser.ConfigParser, section: str, key: str, default: 
     return parser.get(section, key, fallback=default).strip()
 
 
+# ─── Cfg ───────────────────────────────────────────────────────────────────────
+
 class Cfg:
     # Inventory
     inventory_path: str = "url_monitoring_inventory.xlsx"
@@ -76,6 +85,11 @@ class Cfg:
     combined_log_dir: str = "."
     internal_log_dir: str = "Internal_url_logs"
     external_log_dir: str = "External_url_logs"
+
+    # Logging
+    run_log_dir: str = "Run_logs"          # directory for url_monitor_run.log
+    url_detail_log: bool = True            # per-URL detail log on/off
+    url_detail_log_dir: str = "Detail_logs"  # directory for url_detail_*.log
 
     # Runner/runtime
     dispatch_external: bool = True
@@ -105,7 +119,7 @@ class Cfg:
     github_download_timeout_seconds: int = 60
     github_api_verify_ssl: bool = False
 
-    # Proxy (corporate — used for internal checks and GitHub API calls ONLY)
+    # Proxy (corporate — for internal checks and GitHub API calls ONLY)
     proxies: dict = {}
 
     @classmethod
@@ -116,10 +130,8 @@ class Cfg:
 
         c = cls()
 
-        # Backward compatibility: older config used [inventory] log_directory.
         old_log_dir = _getstr(parser, "inventory", "log_directory", c.combined_log_dir)
 
-        # Inventory + row default values.
         c.inventory_path = _getstr(parser, "inventory", "inventory_path", c.inventory_path)
         c.sheet_name = _getstr(parser, "inventory", "sheet_name", c.sheet_name)
         c.inventory_defaults = InventoryDefaults(
@@ -127,7 +139,6 @@ class Cfg:
             read_body=_getbool(parser, "inventory", "default_read_body", True),
             max_body_bytes=_getint(parser, "inventory", "default_max_body_bytes", 200000),
             timeout_seconds=_getint(parser, "inventory", "default_timeout_seconds", 10),
-            # FIX: default is False — external runner (GitHub Actions) has no corporate proxy.
             external_proxy=_getbool(parser, "inventory", "default_external_proxy", False),
             internal_proxy=_getbool(parser, "inventory", "default_internal_proxy", False),
             ingress_proxy=_getbool(parser, "inventory", "default_ingress_proxy", False),
@@ -139,43 +150,44 @@ class Cfg:
             blank_enable_value_default=_getbool(parser, "inventory", "blank_enable_value_default", False),
         )
 
-        # Paths. [paths] is preferred; old [inventory] log_directory still works.
-        c.combined_log_dir = _getstr(parser, "paths", "combined_log_dir", old_log_dir)
-        c.internal_log_dir = _getstr(parser, "paths", "internal_log_dir", c.internal_log_dir)
-        c.external_log_dir = _getstr(parser, "paths", "external_log_dir", c.external_log_dir)
+        c.combined_log_dir  = _getstr(parser, "paths", "combined_log_dir", old_log_dir)
+        c.internal_log_dir  = _getstr(parser, "paths", "internal_log_dir", c.internal_log_dir)
+        c.external_log_dir  = _getstr(parser, "paths", "external_log_dir", c.external_log_dir)
 
-        # Runtime/runner settings.
-        c.dispatch_external = _getbool(parser, "runner", "dispatch_external", True)
-        c.wait_seconds = _getint(parser, "runner", "wait_seconds", 60)
-        c.internal_concurrency = _getint(parser, "runner", "internal_concurrency", 25)
-        c.external_concurrency = _getint(parser, "runner", "external_concurrency", 25)
-        c.internal_verify_ssl = _getbool(parser, "runner", "internal_verify_ssl", False)
-        c.external_verify_ssl = _getbool(parser, "runner", "external_verify_ssl", True)
-        c.cleanup_days = _getint(parser, "runner", "cleanup_days", 14)
-        c.internal_application = _getstr(parser, "runner", "internal_application", "URLMonitor")
-        c.internal_action = _getstr(parser, "runner", "internal_action", "url_monitor")
-        c.external_application = _getstr(parser, "runner", "external_application", "URLMonitor_v2")
-        c.external_action = _getstr(parser, "runner", "external_action", "URLMonitor_v2")
-        c.user_agent = _getstr(parser, "runner", "user_agent", "URLMonitor")
-        c.external_timezone = _getstr(parser, "runner", "external_timezone", "Europe/Amsterdam")
+        # ── Logging section ──────────────────────────────────────────────────
+        c.run_log_dir        = _getstr(parser, "logging", "run_log_dir", c.run_log_dir)
+        c.url_detail_log     = _getbool(parser, "logging", "url_detail_log", c.url_detail_log)
+        c.url_detail_log_dir = _getstr(parser, "logging", "url_detail_log_dir", c.url_detail_log_dir)
 
-        # GitHub settings.
-        c.github_owner = _getstr(parser, "github", "owner", "")
-        c.github_repo = _getstr(parser, "github", "repo", "")
-        c.event_type = _getstr(parser, "github", "event_type", "url-monitor-check")
-        c.api_base = _getstr(parser, "github", "api_base", "https://api.github.com").rstrip("/")
-        raw_token = _getstr(parser, "github", "token", "")
-        c.token_env_var = _getstr(parser, "github", "token_env_var", "GITHUB_TOKEN")
-        c.token = raw_token or os.environ.get(c.token_env_var, "").strip()
-        c.artifact_name = _getstr(parser, "github", "artifact_name", "url-monitor-logs")
-        c.delete_artifact_after_download = _getbool(parser, "github", "delete_artifact_after_download", True)
-        c.github_api_timeout_seconds = _getint(parser, "github", "api_timeout_seconds", 30)
+        c.dispatch_external     = _getbool(parser, "runner", "dispatch_external", True)
+        c.wait_seconds          = _getint(parser, "runner", "wait_seconds", 60)
+        c.internal_concurrency  = _getint(parser, "runner", "internal_concurrency", 25)
+        c.external_concurrency  = _getint(parser, "runner", "external_concurrency", 25)
+        c.internal_verify_ssl   = _getbool(parser, "runner", "internal_verify_ssl", False)
+        c.external_verify_ssl   = _getbool(parser, "runner", "external_verify_ssl", True)
+        c.cleanup_days          = _getint(parser, "runner", "cleanup_days", 14)
+        c.internal_application  = _getstr(parser, "runner", "internal_application", "URLMonitor")
+        c.internal_action       = _getstr(parser, "runner", "internal_action", "url_monitor")
+        c.external_application  = _getstr(parser, "runner", "external_application", "URLMonitor_v2")
+        c.external_action       = _getstr(parser, "runner", "external_action", "URLMonitor_v2")
+        c.user_agent            = _getstr(parser, "runner", "user_agent", "URLMonitor")
+        c.external_timezone     = _getstr(parser, "runner", "external_timezone", "Europe/Amsterdam")
+
+        c.github_owner                    = _getstr(parser, "github", "owner", "")
+        c.github_repo                     = _getstr(parser, "github", "repo", "")
+        c.event_type                      = _getstr(parser, "github", "event_type", "url-monitor-check")
+        c.api_base                        = _getstr(parser, "github", "api_base", "https://api.github.com").rstrip("/")
+        raw_token                         = _getstr(parser, "github", "token", "")
+        c.token_env_var                   = _getstr(parser, "github", "token_env_var", "GITHUB_TOKEN")
+        c.token                           = raw_token or os.environ.get(c.token_env_var, "").strip()
+        c.artifact_name                   = _getstr(parser, "github", "artifact_name", "url-monitor-logs")
+        c.delete_artifact_after_download  = _getbool(parser, "github", "delete_artifact_after_download", True)
+        c.github_api_timeout_seconds      = _getint(parser, "github", "api_timeout_seconds", 30)
         c.github_download_timeout_seconds = _getint(parser, "github", "artifact_download_timeout_seconds", 60)
-        c.github_api_verify_ssl = _getbool(parser, "github", "api_verify_ssl", False)
+        c.github_api_verify_ssl           = _getbool(parser, "github", "api_verify_ssl", False)
 
-        # Proxy settings (corporate proxy — for internal checks and GitHub API only).
         proxies: dict = {}
-        http_proxy = _getstr(parser, "proxy", "http", "")
+        http_proxy  = _getstr(parser, "proxy", "http", "")
         https_proxy = _getstr(parser, "proxy", "https", "")
         if http_proxy:
             proxies["http"] = http_proxy
@@ -195,16 +207,15 @@ class Cfg:
         return headers
 
     def external_runner_settings(self) -> dict:
-        """Settings sent to the GitHub Actions runner with the target list."""
         return {
-            "external_log_dir": self.external_log_dir,
+            "external_log_dir":    self.external_log_dir,
             "external_concurrency": self.external_concurrency,
             "external_verify_ssl": self.external_verify_ssl,
             "external_application": self.external_application,
-            "external_action": self.external_action,
-            "user_agent": self.user_agent,
-            "external_timezone": self.external_timezone,
-            # Deliberately no proxy key: GitHub Actions has no corporate proxy.
+            "external_action":     self.external_action,
+            "user_agent":          self.user_agent,
+            "external_timezone":   self.external_timezone,
+            # No proxy key: GitHub Actions has no corporate proxy.
         }
 
 
@@ -212,17 +223,13 @@ class Cfg:
 
 def _serialize(targets: Iterable[CheckTarget]) -> List[dict]:
     """
-    Serialize targets for dispatch to GitHub Actions.
-
-    FIX: force use_proxy=False on every external target before serialising.
-    The GitHub Actions runner is outside the corporate network and has no
-    access to the corporate proxy. Even if a row in Excel accidentally has
-    external_proxy=TRUE, we must not send the corporate proxy to the runner.
+    Serialize targets for GitHub Actions dispatch.
+    Forces use_proxy=False: GitHub runner has no corporate proxy.
     """
     result = []
     for t in targets:
         d = dataclasses.asdict(t)
-        d["use_proxy"] = False   # ← safety: external runner never uses corporate proxy
+        d["use_proxy"] = False
         result.append(d)
     return result
 
@@ -232,10 +239,12 @@ def trigger_dispatch(cfg: Cfg, targets: List[CheckTarget]) -> None:
     payload = {
         "event_type": cfg.event_type,
         "client_payload": {
-            "targets": _serialize(targets),
+            "targets":  _serialize(targets),
             "settings": cfg.external_runner_settings(),
         },
     }
+    logger.info("Dispatching to GitHub Actions  repo=%s/%s  targets=%d",
+                cfg.github_owner, cfg.github_repo, len(targets))
     r = requests.post(
         url,
         headers=cfg.gh_headers(),
@@ -245,12 +254,13 @@ def trigger_dispatch(cfg: Cfg, targets: List[CheckTarget]) -> None:
         verify=cfg.github_api_verify_ssl,
     )
     r.raise_for_status()
-    print(f"✅ Dispatched '{cfg.event_type}' for {len(targets)} target(s).")
+    logger.info("Dispatch accepted  event=%s  http=%d", cfg.event_type, r.status_code)
 
 
 def get_latest_run_id(cfg: Cfg) -> int:
     url = f"{cfg.api_base}/repos/{cfg.github_owner}/{cfg.github_repo}/actions/runs"
     params = {"event": "repository_dispatch", "per_page": 1}
+    logger.info("Fetching latest workflow run id  repo=%s/%s", cfg.github_owner, cfg.github_repo)
     r = requests.get(
         url,
         headers=cfg.gh_headers(),
@@ -263,12 +273,15 @@ def get_latest_run_id(cfg: Cfg) -> int:
     runs = r.json().get("workflow_runs", [])
     if not runs:
         raise RuntimeError("No dispatch runs found")
-    return runs[0]["id"]
+    run_id = runs[0]["id"]
+    logger.info("Latest run id=%d  status=%s  conclusion=%s",
+                run_id, runs[0].get("status"), runs[0].get("conclusion"))
+    return run_id
 
 
 def get_artifact_info(cfg: Cfg, run_id: int) -> dict:
-    """Return the configured artifact metadata for a completed workflow run."""
     url = f"{cfg.api_base}/repos/{cfg.github_owner}/{cfg.github_repo}/actions/runs/{run_id}/artifacts"
+    logger.info("Fetching artifact list  run_id=%d  artifact_name=%s", run_id, cfg.artifact_name)
     r = requests.get(
         url,
         headers=cfg.gh_headers(),
@@ -279,13 +292,15 @@ def get_artifact_info(cfg: Cfg, run_id: int) -> dict:
     r.raise_for_status()
     for art in r.json().get("artifacts", []):
         if art.get("name") == cfg.artifact_name:
+            logger.info("Found artifact  id=%s  size_mb=%.2f",
+                        art["id"], art.get("size_in_bytes", 0) / 1_048_576)
             return art
     raise RuntimeError(f"Artifact '{cfg.artifact_name}' not found in run {run_id}")
 
 
 def delete_artifact(cfg: Cfg, artifact_id: int) -> None:
-    """Delete a GitHub Actions artifact after it has been downloaded."""
     url = f"{cfg.api_base}/repos/{cfg.github_owner}/{cfg.github_repo}/actions/artifacts/{artifact_id}"
+    logger.info("Deleting GitHub artifact  id=%d", artifact_id)
     r = requests.delete(
         url,
         headers=cfg.gh_headers(),
@@ -294,16 +309,17 @@ def delete_artifact(cfg: Cfg, artifact_id: int) -> None:
         verify=cfg.github_api_verify_ssl,
     )
     if r.status_code == 204:
-        print(f"🗑️  Deleted GitHub artifact {artifact_id}.")
+        logger.info("Artifact deleted  id=%d", artifact_id)
         return
     if r.status_code == 404:
-        print(f"⚠️  GitHub artifact {artifact_id} was already deleted or not found.")
+        logger.warning("Artifact already deleted or not found  id=%d", artifact_id)
         return
     r.raise_for_status()
 
 
 def download_and_extract(cfg: Cfg, zip_url: str) -> None:
     os.makedirs(cfg.external_log_dir, exist_ok=True)
+    logger.info("Downloading artifact  url=%s", zip_url)
     r = requests.get(
         zip_url,
         headers=cfg.gh_headers(),
@@ -314,16 +330,20 @@ def download_and_extract(cfg: Cfg, zip_url: str) -> None:
     )
     r.raise_for_status()
     zip_path = os.path.join(cfg.external_log_dir, "url-monitor-logs.zip")
+    total_bytes = 0
     with open(zip_path, "wb") as f:
         for chunk in r.iter_content(chunk_size=8192):
             f.write(chunk)
+            total_bytes += len(chunk)
+    logger.info("Downloaded %.1f KB", total_bytes / 1024)
     with zipfile.ZipFile(zip_path, "r") as z:
+        names = z.namelist()
         z.extractall(cfg.external_log_dir)
+    logger.info("Extracted %d file(s) into %s", len(names), cfg.external_log_dir)
     try:
         os.remove(zip_path)
     except OSError:
         pass
-    print(f"📂 Extracted external logs into {cfg.external_log_dir}/")
 
 
 # ─── Combine logs ──────────────────────────────────────────────────────────────
@@ -347,7 +367,8 @@ def _read_jsonl(path: str) -> List[dict]:
 def _latest_log(folder: str) -> str:
     if not os.path.isdir(folder):
         return ""
-    candidates = [os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".log")]
+    candidates = [os.path.join(folder, f) for f in os.listdir(folder)
+                  if f.endswith(".log") and not f.startswith("url_monitor_run")]
     if not candidates:
         return ""
     return max(candidates, key=os.path.getmtime)
@@ -366,10 +387,14 @@ def combine_logs(cfg: Cfg) -> str:
         for obj in internal + external:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-    print(f"✅ Combined log: {out_path}  ({len(internal) + len(external)} entries)")
+    logger.info("Combined log written: %s  (%d internal + %d external = %d entries)",
+                out_path, len(internal), len(external), len(internal) + len(external))
+
     cleanup_old(cfg.internal_log_dir, days=cfg.cleanup_days)
     cleanup_old(cfg.external_log_dir, days=cfg.cleanup_days)
     cleanup_old(cfg.combined_log_dir, days=cfg.cleanup_days)
+    if cfg.url_detail_log:
+        cleanup_old(cfg.url_detail_log_dir, days=cfg.cleanup_days)
     return out_path
 
 
@@ -396,30 +421,43 @@ def main(
 ) -> None:
     cfg = Cfg.load(config_path)
 
+    # ── Initialise logging (first thing after config is loaded) ─────────────
+    setup_logging(log_dir=cfg.run_log_dir)
+    logger.info("Config loaded  path=%s", config_path)
+    logger.info("Inventory: %s  sheet=%s", cfg.inventory_path, cfg.sheet_name)
+    logger.info("Log dirs  internal=%s  external=%s  combined=%s",
+                cfg.internal_log_dir, cfg.external_log_dir, cfg.combined_log_dir)
+    logger.info("Detail log  enabled=%s  dir=%s",
+                cfg.url_detail_log, cfg.url_detail_log_dir)
+
     if dispatch_external is not None:
         cfg.dispatch_external = dispatch_external
     if wait_seconds is not None:
         cfg.wait_seconds = wait_seconds
 
+    # ── Load inventory ────────────────────────────────────────────────────────
     all_targets = load_inventory(
         cfg.inventory_path,
         sheet_name=cfg.sheet_name,
         defaults=cfg.inventory_defaults,
     )
     internal, external = split_by_runner(all_targets)
-    print(f"Loaded {len(all_targets)} targets "
-          f"(internal: {len(internal)}, external: {len(external)})")
+    logger.info("Targets loaded  total=%d  internal=%d  external=%d",
+                len(all_targets), len(internal), len(external))
 
-    can_dispatch = bool(cfg.dispatch_external and external and cfg.token and cfg.github_owner and cfg.github_repo)
+    can_dispatch = bool(
+        cfg.dispatch_external and external
+        and cfg.token and cfg.github_owner and cfg.github_repo
+    )
 
     if can_dispatch:
         trigger_dispatch(cfg, external)
     elif external and cfg.dispatch_external:
-        print("⚠️  No complete GitHub config/token; running external targets locally instead.")
+        logger.warning("No complete GitHub config/token — running external targets locally.")
 
-    # Internal checks always use the corporate proxy (if configured per target).
+    # ── Internal checks ───────────────────────────────────────────────────────
     proxies = cfg.proxies or None
-    run_internal(
+    internal_results = run_internal(
         internal,
         log_dir=cfg.internal_log_dir,
         concurrency=cfg.internal_concurrency,
@@ -430,27 +468,25 @@ def main(
         user_agent=cfg.user_agent,
     )
 
+    # ── Wait for and fetch GitHub artifact ───────────────────────────────────
     if can_dispatch:
-        print(f"⏳ Waiting {cfg.wait_seconds}s for external workflow…")
+        logger.info("Waiting %ds for external workflow to complete…", cfg.wait_seconds)
         time.sleep(cfg.wait_seconds)
         try:
-            run_id = get_latest_run_id(cfg)
+            run_id   = get_latest_run_id(cfg)
             artifact = get_artifact_info(cfg, run_id)
             download_and_extract(cfg, artifact["archive_download_url"])
             if cfg.delete_artifact_after_download:
                 delete_artifact(cfg, int(artifact["id"]))
         except Exception as e:
-            print(f"⚠️  Could not fetch/delete external artifact: {e}")
+            logger.error("Could not fetch/delete external artifact: %s", e)
     else:
-        # FIX: external fallback (local run) also passes proxies=None.
-        # Even when running locally, external targets are public URLs that
-        # must NOT go through the corporate proxy.
         from modules.external_url_monitor import run_external
         run_external(
             external,
             log_dir=cfg.external_log_dir,
             concurrency=cfg.external_concurrency,
-            proxies=None,   # ← never use corporate proxy for external targets
+            proxies=None,
             verify_ssl=cfg.external_verify_ssl,
             application=cfg.external_application,
             action=cfg.external_action,
@@ -458,8 +494,19 @@ def main(
             timezone=cfg.external_timezone,
         )
 
+    # ── Combine logs (Splunk) ─────────────────────────────────────────────────
     combined_path = combine_logs(cfg)
-    print_summary(_to_results(combined_path))
+
+    # ── Per-URL detail log (separate, toggleable) ─────────────────────────────
+    all_results = _to_results(combined_path)
+    write_detail_log(
+        log_dir=cfg.url_detail_log_dir,
+        results=all_results,
+        enabled=cfg.url_detail_log,
+    )
+
+    print_summary(all_results)
+    logger.info("Run complete.")
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
@@ -469,17 +516,10 @@ if __name__ == "__main__":
 
     p = argparse.ArgumentParser(description="URL Monitor orchestrator")
     p.add_argument("--config", default="url_monitor_config.ini")
-    p.add_argument(
-        "--no-dispatch",
-        action="store_true",
-        help="Override config and run external checks locally instead of dispatching to GitHub Actions.",
-    )
-    p.add_argument(
-        "--wait",
-        type=int,
-        default=None,
-        help="Override [runner] wait_seconds for this run only.",
-    )
+    p.add_argument("--no-dispatch", action="store_true",
+                   help="Run external checks locally instead of dispatching to GitHub Actions.")
+    p.add_argument("--wait", type=int, default=None,
+                   help="Override [runner] wait_seconds for this run only.")
     args = p.parse_args()
 
     main(
