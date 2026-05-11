@@ -151,12 +151,11 @@ def _do_request(url: str, *, timeout: int, verify: bool,
                 proxies: Optional[dict], read_body: bool,
                 max_body_bytes: int, user_agent: str):
     """
-    Try HEAD first, fall back to GET when needed.
+    Check URL and follow redirects.
 
-    Returns: (status, final_url, body, content_length_header, bytes_read, body_truncated)
-        content_length_header : int   -- value from Content-Length header (-1 if absent)
-        bytes_read            : int   -- bytes actually read from wire (0 on HEAD-only)
-        body_truncated        : bool  -- True if we stopped reading at max_body_bytes
+    Important:
+    - If read_body=True, use GET directly. This matches `curl -L`.
+    - HEAD is only used for lightweight checks where body is not needed.
     """
     headers = {"User-Agent": user_agent}
     body = ""
@@ -166,66 +165,89 @@ def _do_request(url: str, *, timeout: int, verify: bool,
     bytes_read = 0
     truncated = False
 
-    # Phase 1: HEAD
-    try:
-        r = requests.head(
-            url,
-            headers=headers,
-            timeout=timeout,
-            verify=verify,
-            proxies=proxies,
-            allow_redirects=True,
-        )
-        status = r.status_code
-        final_url = r.url
-        content_length = _content_length_header(r)
-        # If server rejects HEAD or we need body, fall through to GET
-        if status in (405, 501) or (read_body and not r.content):
-            raise _NeedsGet()
-        return status, final_url, body, content_length, bytes_read, truncated
-    except _NeedsGet:
-        pass
-    except (Timeout, SSLError, ReqConnectionError, RequestException):
-        # Some hosts refuse HEAD with assorted errors. Try GET.
-        pass
+    session = requests.Session()
+    session.trust_env = False
+    req_proxies = proxies or {}
 
-    # Phase 2: GET
-    r = requests.get(
-        url,
-        headers=headers,
-        timeout=timeout,
-        verify=verify,
-        proxies=proxies,
-        allow_redirects=True,
-        stream=read_body,  # stream so we can cap body size
-    )
-    status = r.status_code
-    final_url = r.url
-    content_length = _content_length_header(r)
-
-    if read_body:
-        # Read at most max_body_bytes
+    def _read_response_body(r):
         chunks = []
         total = 0
+        was_truncated = False
+
         for chunk in r.iter_content(chunk_size=8192, decode_unicode=False):
             if not chunk:
                 continue
             chunks.append(chunk)
             total += len(chunk)
             if total >= max_body_bytes:
-                truncated = True
+                was_truncated = True
                 break
+
         raw = b"".join(chunks)[:max_body_bytes]
-        bytes_read = len(raw)
         try:
             enc = r.encoding or r.apparent_encoding or "utf-8"
-            body = raw.decode(enc, errors="replace")
+            text = raw.decode(enc, errors="replace")
         except Exception:
-            body = raw.decode("utf-8", errors="replace")
+            text = raw.decode("utf-8", errors="replace")
+
+        return text, len(raw), was_truncated
+
+    # If we need body or text validation, use GET directly.
+    # This follows /api -> /api/info.json exactly like curl -L.
+    if read_body:
+        r = session.get(
+            url,
+            headers=headers,
+            timeout=timeout,
+            verify=verify,
+            proxies=req_proxies,
+            allow_redirects=True,
+            stream=True,
+        )
+        status = r.status_code
+        final_url = r.url
+        content_length = _content_length_header(r)
+        body, bytes_read, truncated = _read_response_body(r)
         r.close()
-    else:
-        # We did the GET but caller didn't want body; close cleanly.
+        return status, final_url, body, content_length, bytes_read, truncated
+
+    # Otherwise try HEAD first.
+    try:
+        r = session.head(
+            url,
+            headers=headers,
+            timeout=timeout,
+            verify=verify,
+            proxies=req_proxies,
+            allow_redirects=True,
+        )
+        status = r.status_code
+        final_url = r.url
+        content_length = _content_length_header(r)
+
+        if status not in (405, 501):
+            r.close()
+            return status, final_url, body, content_length, bytes_read, truncated
+
         r.close()
+
+    except (Timeout, SSLError, ReqConnectionError, RequestException):
+        pass
+
+    # Fallback GET without body.
+    r = session.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        verify=verify,
+        proxies=req_proxies,
+        allow_redirects=True,
+        stream=False,
+    )
+    status = r.status_code
+    final_url = r.url
+    content_length = _content_length_header(r)
+    r.close()
 
     return status, final_url, body, content_length, bytes_read, truncated
 
