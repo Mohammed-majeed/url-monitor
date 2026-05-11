@@ -21,7 +21,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import List, Optional
 from urllib.parse import urlparse
-
+from urllib.parse import urlsplit, urlunsplit
 import requests
 from requests.exceptions import (
     Timeout,
