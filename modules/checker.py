@@ -175,8 +175,9 @@ async def _fetch(
     Async HTTP fetch. Returns:
         (status, final_url, body, content_length_header, bytes_read, body_truncated)
 
-    Cookie jar: stores JSESSIONID etc. across the redirect chain so
-    session-gated apps (GeoServer) don't loop infinitely.
+    Important:
+    - If read_body=True, use GET directly.
+    - If read_body=False, try HEAD first and fall back to GET when needed.
     """
     ssl_ctx = _build_ssl_context(verify_ssl)
     connector = TCPConnector(ssl=ssl_ctx, limit=0)
@@ -206,32 +207,40 @@ async def _fetch(
         trust_env=trust_env,
     ) as session:
         resp: Optional[aiohttp.ClientResponse] = None
+
         try:
-            # Phase 1: HEAD
-            try:
-                resp = await session.head(
-                    url,
-                    timeout=timeout,
-                    allow_redirects=True,
-                    proxy=proxy_url,
-                    max_redirects=MAX_REDIRECTS,
-                )
-                if resp.status in (405, 501):
-                    logger.debug("HEAD rejected (%d), falling back to GET  url=%s",
-                                 resp.status, url)
-                    await resp.release()
-                    resp = None
-                    raise _NeedGet()
-            except _NeedGet:
-                pass
-            except aiohttp.ClientResponseError:
-                if resp is not None:
-                    await resp.release()
-                    resp = None
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                if resp is not None:
-                    await resp.release()
-                    resp = None
+            # Phase 1: HEAD only when we do NOT need the body.
+            # When expected_text is configured, read_body=True, so we must use GET.
+            if not read_body:
+                try:
+                    resp = await session.head(
+                        url,
+                        timeout=timeout,
+                        allow_redirects=True,
+                        proxy=proxy_url,
+                        max_redirects=MAX_REDIRECTS,
+                    )
+
+                    if resp.status in (405, 501):
+                        logger.debug(
+                            "HEAD rejected (%d), falling back to GET  url=%s",
+                            resp.status,
+                            url,
+                        )
+                        await resp.release()
+                        resp = None
+                        raise _NeedGet()
+
+                except _NeedGet:
+                    pass
+                except aiohttp.ClientResponseError:
+                    if resp is not None:
+                        await resp.release()
+                        resp = None
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    if resp is not None:
+                        await resp.release()
+                        resp = None
 
             # Phase 2: GET
             if resp is None:
@@ -244,19 +253,28 @@ async def _fetch(
                     max_redirects=MAX_REDIRECTS,
                 )
 
+            # Works for both HEAD and GET responses.
             status = resp.status
             final_url = str(resp.url)
             content_length = _content_length_from_headers(resp.headers)
 
-            logger.debug("Response  url=%s  status=%d  final_url=%s", url, status, final_url)
+            logger.debug(
+                "Response  url=%s  status=%d  final_url=%s",
+                url,
+                status,
+                final_url,
+            )
 
+            # Only GET responses should have a useful body.
             if read_body:
                 raw = await resp.content.read(max_body_bytes + 1)
                 if len(raw) > max_body_bytes:
                     truncated = True
                     raw = raw[:max_body_bytes]
+
                 bytes_read = len(raw)
                 charset = resp.charset or "utf-8"
+
                 try:
                     body = raw.decode(charset, errors="replace")
                 except Exception:
