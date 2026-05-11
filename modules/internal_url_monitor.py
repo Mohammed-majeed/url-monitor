@@ -2,25 +2,21 @@
 internal_url_monitor.py
 =======================
 Runs URL checks LOCALLY from inside the corporate network.
-
-Mirrors internal_ssl_cert_inspecter.py: takes a list of targets, returns a
-list of CheckResults, writes a JSON-lines log file.
-
-Use this for any CheckTarget whose runner is `InternalRunner` (or empty).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Iterable, List, Optional
 
 from .checker import CheckResult, check_one
 from .inventory import CheckTarget, load_inventory
 from .log_writer import make_log_path, print_summary, write_results
 
+logger = logging.getLogger("url_monitor.internal")
 
 DEFAULT_LOG_DIR = "Internal_url_logs"
 DEFAULT_CONCURRENCY = 25
@@ -38,15 +34,18 @@ def run_internal(
     user_agent: str = "URLMonitor",
 ) -> List[CheckResult]:
     """
-    Check the given targets in parallel and write a single JSON-lines log
-    file under `log_dir`. Returns the list of CheckResults.
+    Check internal targets in parallel and write a JSON-lines log file.
     """
     targets = list(targets)
     if not targets:
-        print("No internal targets to check.")
+        logger.info("No internal targets to check.")
         return []
 
+    logger.info("Starting internal checks  targets=%d  concurrency=%d  verify_ssl=%s",
+                len(targets), concurrency, verify_ssl)
+
     log_path = make_log_path(log_dir)
+    logger.info("Internal log file: %s", log_path)
 
     def _do(t: CheckTarget) -> CheckResult:
         return check_one(
@@ -63,24 +62,21 @@ def run_internal(
         for r in ex.map(_do, targets):
             results.append(r)
 
-    # Stable sort: by env, app, url_id
     results.sort(key=lambda r: (r.environment, r.app_name, r.url_id, r.target_kind))
     write_results(log_path, results, echo=False)
-    print(f"📝 Internal log: {log_path}  ({len(results)} entries)")
+
+    ok = sum(1 for r in results if r.exit_code == "0")
+    logger.info("Internal checks complete  total=%d  ok=%d  failed=%d  log=%s",
+                len(results), ok, len(results) - ok, log_path)
     return results
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────────────
 
 def _main():
-    parser = argparse.ArgumentParser(
-        description="Run URL checks locally for internal targets.",
-    )
-    parser.add_argument("inventory", nargs="?",
-                        help="Path to url_monitoring_inventory.xlsx")
-    parser.add_argument("--targets-json",
-                        help="Alternatively, path to a JSON file containing "
-                             "a serialized target list (used by the orchestrator).")
+    parser = argparse.ArgumentParser(description="Run URL checks locally for internal targets.")
+    parser.add_argument("inventory", nargs="?", help="Path to url_monitoring_inventory.xlsx")
+    parser.add_argument("--targets-json", help="Path to a JSON file with a serialized target list.")
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--verify-ssl", action="store_true")

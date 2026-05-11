@@ -1,46 +1,42 @@
 """
 checker.py
 ==========
-Core HTTP checker. One function `check_one(target, ...) -> CheckResult`.
+Core async HTTP checker. One function `check_one(target, ...) -> CheckResult`.
 
-Mirrors the structure of internal_ssl_cert_inspecter.fetch_certificate(): one
-target in, one structured result out. The orchestrator decides where the
-target runs (locally vs GitHub Actions runner).
-
-Design notes:
-- Synchronous, one URL per call. Parallelism is the orchestrator's job.
-  Same shape as the SSL inspecters.
-- HEAD then GET fallback (HEAD is cheap, but some servers reject it).
-- expected_text: comma-separated list, ALL must appear in body (AND).
-- expected_statuses: see status_spec.StatusSpec.
+Uses aiohttp (async) with a cookie jar per request:
+- Cookie jar fixes session-cookie redirect loops (e.g. GeoServer /web/?0).
+- HEAD → GET fallback.
+- Max 10 redirects (curl's 50 was too lenient).
+- Proxy isolation: trust_env=False when no proxy configured.
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import ssl
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
-from typing import List, Optional
-from urllib.parse import urlparse
-from urllib.parse import urlsplit, urlunsplit
-import requests
-from requests.exceptions import (
-    Timeout,
-    SSLError,
-    ConnectionError as ReqConnectionError,
-    RequestException,
-)
+from typing import List, Optional, Tuple
+
+import aiohttp
+from aiohttp import ClientTimeout, TCPConnector
 
 from .inventory import CheckTarget
 from .status_spec import StatusSpec, looks_like_login
 
-
-# Suppress only the InsecureRequestWarning when verify=False
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except Exception:
     pass
 
+logger = logging.getLogger("url_monitor.checker")
+
+MAX_REDIRECTS = 10
+
+
+# ─── CheckResult ───────────────────────────────────────────────────────────────
 
 @dataclass
 class CheckResult:
@@ -49,12 +45,12 @@ class CheckResult:
     finish_time: str
     elapsed_time: str
 
-    application: str       # "URLMonitor"
-    action: str            # "url_monitor"
-    method: str            # "HTTP"
+    application: str
+    action: str
+    method: str
 
     url_id: str
-    target_kind: str       # external | internal | ingress
+    target_kind: str
     environment: str
     location_type: str
     app_name: str
@@ -65,17 +61,17 @@ class CheckResult:
     final_url: str
 
     http_code: int
-    status_category: str   # success / redirect / client_error / server_error / error
+    status_category: str
     looks_like_login: bool
 
-    text_check: str        # "skipped" | "passed" | "failed:<missing terms>"
+    text_check: str
     expected_statuses: str
     expected_text: List[str] = field(default_factory=list)
 
     response_time_ms: int = 0
-    content_length_header: int = -1   # Content-Length header (-1 if absent)
-    bytes_read: int = 0               # bytes actually read off the wire
-    body_truncated: bool = False      # True if hit max_body_bytes cap
+    content_length_header: int = -1
+    bytes_read: int = 0
+    body_truncated: bool = False
 
     msg: str = ""
     exit_code: str = "1"
@@ -83,6 +79,8 @@ class CheckResult:
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
 
+
+# ─── Time helpers ──────────────────────────────────────────────────────────────
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).astimezone()
@@ -101,27 +99,13 @@ def _fmt_elapsed(start: datetime, end: datetime) -> str:
     return f"{h}:{m:02d}:{s:06.3f}"
 
 
+# ─── URL helpers ───────────────────────────────────────────────────────────────
+
 def _normalize_url(raw: str) -> str:
-    """
-    Normalize URL for checking.
-
-    Important:
-    - Add https:// when scheme is missing.
-    - Lowercase only scheme + hostname.
-    - Preserve path/query case, because paths can be case-sensitive.
-    """
     u = (raw or "").strip()
-    if not u:
-        return u
-
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
-
-    parts = urlsplit(u)
-    scheme = parts.scheme.lower()
-    netloc = parts.netloc.lower()
-
-    return urlunsplit((scheme, netloc, parts.path, parts.query, parts.fragment))
+    return u
 
 
 def _strip_url_scheme(url: str) -> str:
@@ -133,6 +117,8 @@ def _strip_url_scheme(url: str) -> str:
     return u
 
 
+# ─── HTTP helpers ──────────────────────────────────────────────────────────────
+
 def _status_category(code: int) -> str:
     if 200 <= code < 300: return "success"
     if 300 <= code < 400: return "redirect"
@@ -142,7 +128,6 @@ def _status_category(code: int) -> str:
 
 
 def _check_text(body: str, expected_text: List[str]) -> str:
-    """Return 'skipped' | 'passed' | 'failed:term1|term2'."""
     if not expected_text:
         return "skipped"
     body_lc = (body or "").lower()
@@ -152,9 +137,8 @@ def _check_text(body: str, expected_text: List[str]) -> str:
     return "failed:" + "|".join(missing)
 
 
-def _content_length_header(r) -> int:
-    """Return Content-Length header as int, or -1 if absent / not numeric."""
-    raw = r.headers.get("Content-Length")
+def _content_length_from_headers(headers) -> int:
+    raw = headers.get("Content-Length")
     if raw is None:
         return -1
     try:
@@ -163,21 +147,48 @@ def _content_length_header(r) -> int:
         return -1
 
 
-def _do_request(url: str, *, timeout: int, verify: bool,
-                proxies: Optional[dict], read_body: bool,
-                max_body_bytes: int, user_agent: str):
-    """
-    Curl-based checker.
+def _build_ssl_context(verify: bool) -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
-    This follows redirects like:
-        curl -kL https://host/path
 
-    It is often more reliable in corporate/RWS environments than Python requests,
-    especially with proxy, SSL, Schannel/certificates, and redirect behaviour.
+class _NeedGet(Exception):
+    """HEAD rejected by server; retry with GET."""
+
+
+# ─── Core async fetch ──────────────────────────────────────────────────────────
+
+async def _fetch(
+    url: str,
+    *,
+    timeout_seconds: int,
+    verify_ssl: bool,
+    proxies: Optional[dict],
+    read_body: bool,
+    max_body_bytes: int,
+    user_agent: str,
+) -> Tuple[int, str, str, int, int, bool]:
     """
-    import os
-    import subprocess
-    import tempfile
+    Async HTTP fetch. Returns:
+        (status, final_url, body, content_length_header, bytes_read, body_truncated)
+
+    Cookie jar: stores JSESSIONID etc. across the redirect chain so
+    session-gated apps (GeoServer) don't loop infinitely.
+    """
+    ssl_ctx = _build_ssl_context(verify_ssl)
+    connector = TCPConnector(ssl=ssl_ctx, limit=0)
+
+    proxy_url: Optional[str] = None
+    if proxies:
+        proxy_url = proxies.get("https") or proxies.get("http")
+
+    timeout = ClientTimeout(total=timeout_seconds)
+    headers = {"User-Agent": user_agent}
+    cookie_jar = aiohttp.CookieJar(unsafe=True)
+    trust_env = proxy_url is not None
 
     body = ""
     final_url = url
@@ -186,102 +197,82 @@ def _do_request(url: str, *, timeout: int, verify: bool,
     bytes_read = 0
     truncated = False
 
-    with tempfile.TemporaryDirectory() as td:
-        body_path = os.path.join(td, "body.out")
-        header_path = os.path.join(td, "headers.out")
+    logger.debug("Fetching  url=%s  proxy=%s  verify_ssl=%s", url, proxy_url, verify_ssl)
 
-        cmd = [
-            "curl",
-            "-sS",                 # silent, but still show errors
-            "-L",                  # follow redirects
-            "--connect-timeout", str(timeout),
-            "--max-time", str(max(timeout * 3, timeout + 15)),
-            "-A", user_agent,
-            "-D", header_path,     # response headers
-            "-o", body_path,       # response body
-            "-w", "%{http_code}\n%{url_effective}\n",
-        ]
-
-        # Match curl -k only when SSL verification is disabled.
-        if not verify:
-            cmd.append("-k")
-
-        # Important:
-        # If proxies are explicitly passed, use them.
-        # If not, prevent hidden environment proxy from changing the result.
-        if proxies:
-            proxy_url = proxies.get("https") or proxies.get("http")
-            if proxy_url:
-                cmd.extend(["--proxy", proxy_url])
-        else:
-            cmd.extend(["--noproxy", "*"])
-
-        cmd.append(url)
-
+    async with aiohttp.ClientSession(
+        connector=connector,
+        cookie_jar=cookie_jar,
+        headers=headers,
+        trust_env=trust_env,
+    ) as session:
+        resp: Optional[aiohttp.ClientResponse] = None
         try:
-            p = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=max(timeout * 3 + 10, timeout + 20),
-            )
-        except subprocess.TimeoutExpired:
-            raise Timeout(f"curl timed out after {timeout}s")
-
-        if p.returncode != 0:
-            err = (p.stderr or "").strip()
-            debug_cmd = " ".join(cmd)
-
-            if p.returncode == 28:
-                raise Timeout(f"curl timeout rc=28: {err}; cmd={debug_cmd}")
-            if p.returncode in (35, 51, 58, 60):
-                raise SSLError(f"curl SSL error rc={p.returncode}: {err}; cmd={debug_cmd}")
-
-            raise ReqConnectionError(
-                f"curl failed rc={p.returncode}: {err}; cmd={debug_cmd}"
-            )
-
-        lines = [x.strip() for x in (p.stdout or "").splitlines() if x.strip()]
-        if len(lines) >= 1:
+            # Phase 1: HEAD
             try:
-                status = int(lines[-2] if len(lines) >= 2 else lines[-1])
-            except ValueError:
-                status = 0
+                resp = await session.head(
+                    url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    proxy=proxy_url,
+                    max_redirects=MAX_REDIRECTS,
+                )
+                if resp.status in (405, 501):
+                    logger.debug("HEAD rejected (%d), falling back to GET  url=%s",
+                                 resp.status, url)
+                    await resp.release()
+                    resp = None
+                    raise _NeedGet()
+            except _NeedGet:
+                pass
+            except aiohttp.ClientResponseError:
+                if resp is not None:
+                    await resp.release()
+                    resp = None
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                if resp is not None:
+                    await resp.release()
+                    resp = None
 
-        if len(lines) >= 2:
-            final_url = lines[-1]
+            # Phase 2: GET
+            if resp is None:
+                logger.debug("GET  url=%s", url)
+                resp = await session.get(
+                    url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    proxy=proxy_url,
+                    max_redirects=MAX_REDIRECTS,
+                )
 
-        # Parse final Content-Length if available.
-        try:
-            with open(header_path, "r", encoding="utf-8", errors="replace") as hf:
-                for line in hf:
-                    if line.lower().startswith("content-length:"):
-                        try:
-                            content_length = int(line.split(":", 1)[1].strip())
-                        except ValueError:
-                            pass
-        except OSError:
-            content_length = -1
+            status = resp.status
+            final_url = str(resp.url)
+            content_length = _content_length_from_headers(resp.headers)
 
-        if read_body:
-            try:
-                with open(body_path, "rb") as bf:
-                    raw = bf.read(max_body_bytes + 1)
+            logger.debug("Response  url=%s  status=%d  final_url=%s", url, status, final_url)
+
+            if read_body:
+                raw = await resp.content.read(max_body_bytes + 1)
                 if len(raw) > max_body_bytes:
                     truncated = True
                     raw = raw[:max_body_bytes]
                 bytes_read = len(raw)
-                body = raw.decode("utf-8", errors="replace")
-            except OSError:
-                body = ""
-                bytes_read = 0
+                charset = resp.charset or "utf-8"
+                try:
+                    body = raw.decode(charset, errors="replace")
+                except Exception:
+                    body = raw.decode("utf-8", errors="replace")
+
+        finally:
+            if resp is not None:
+                try:
+                    await resp.release()
+                except Exception:
+                    pass
 
     return status, final_url, body, content_length, bytes_read, truncated
 
 
-class _NeedsGet(Exception):
-    """Internal sentinel; not exposed."""
-
+# ─── Public synchronous API ────────────────────────────────────────────────────
 
 def check_one(
     target: CheckTarget,
@@ -293,14 +284,16 @@ def check_one(
     action: str = "url_monitor",
 ) -> CheckResult:
     """
-    Check one URL and return a CheckResult.
-
-    The caller should pass `proxies` only when target.use_proxy is True.
+    Check one URL synchronously and return a CheckResult.
+    Runs _fetch() in a fresh event loop — safe with ThreadPoolExecutor.
     """
     started = _now()
     checked_url = _normalize_url(target.url)
     log_url = _strip_url_scheme(target.url)
     log_checked_url = _strip_url_scheme(checked_url)
+
+    logger.info("Checking  [%s/%s]  %s  %s",
+                target.environment, target.target_kind, target.url_id, log_url)
 
     err_type: Optional[str] = None
     err_msg: str = ""
@@ -311,27 +304,39 @@ def check_one(
     bytes_read = 0
     truncated = False
 
+    effective_proxies = proxies if target.use_proxy else None
+
     try:
-        (status, final_url, body,
-         content_length, bytes_read, truncated) = _do_request(
-            checked_url,
-            timeout=target.timeout_seconds,
-            verify=verify_ssl,
-            proxies=proxies if target.use_proxy else None,
-            read_body=target.read_body,
-            max_body_bytes=target.max_body_bytes,
-            user_agent=user_agent,
-        )
-    except Timeout:
+        loop = asyncio.new_event_loop()
+        try:
+            (status, final_url, body,
+             content_length, bytes_read, truncated) = loop.run_until_complete(
+                _fetch(
+                    checked_url,
+                    timeout_seconds=target.timeout_seconds,
+                    verify_ssl=verify_ssl,
+                    proxies=effective_proxies,
+                    read_body=target.read_body,
+                    max_body_bytes=target.max_body_bytes,
+                    user_agent=user_agent,
+                )
+            )
+        finally:
+            loop.close()
+
+    except asyncio.TimeoutError:
         err_type = "TimeoutError"
         err_msg = f"Connection timed out after {target.timeout_seconds}s"
-    except SSLError as e:
+    except aiohttp.ClientSSLError as e:
         err_type = "SSLError"
         err_msg = f"SSL error: {str(e)[:160]}"
-    except ReqConnectionError as e:
+    except aiohttp.ClientConnectorError as e:
         err_type = "ConnectionError"
         err_msg = f"Connection failed: {str(e)[:160]}"
-    except RequestException as e:
+    except aiohttp.TooManyRedirects as e:
+        err_type = "TooManyRedirects"
+        err_msg = f"Redirect loop detected (>{MAX_REDIRECTS} redirects): {str(e)[:120]}"
+    except aiohttp.ClientError as e:
         err_type = type(e).__name__
         err_msg = f"Client error: {str(e)[:160]}"
     except Exception as e:
@@ -358,6 +363,9 @@ def check_one(
             f"app:{target.app_name},"
             f"location:{target.location_type}"
         )
+        logger.warning("FAIL  [%s/%s]  %s  %s  ->  %s: %s",
+                       target.environment, target.target_kind,
+                       target.url_id, log_url, err_type, err_msg[:120])
     else:
         category = _status_category(status)
         status_ok = spec.is_ok(status, login)
@@ -381,6 +389,14 @@ def check_one(
             f"content_length:{content_length},"
             f"body_truncated:{str(truncated).lower()}"
         )
+        if ok:
+            logger.info("OK    [%s/%s]  %s  %s  http=%d  %dms",
+                        target.environment, target.target_kind,
+                        target.url_id, log_url, status, elapsed_ms)
+        else:
+            logger.warning("FAIL  [%s/%s]  %s  %s  http=%d  text_check=%s",
+                           target.environment, target.target_kind,
+                           target.url_id, log_url, status, text_check)
 
     return CheckResult(
         starting_time=_fmt_dt(started),
