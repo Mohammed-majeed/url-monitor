@@ -105,7 +105,7 @@ class Cfg:
     github_download_timeout_seconds: int = 60
     github_api_verify_ssl: bool = False
 
-    # Proxy
+    # Proxy (corporate — used for internal checks and GitHub API calls ONLY)
     proxies: dict = {}
 
     @classmethod
@@ -127,7 +127,8 @@ class Cfg:
             read_body=_getbool(parser, "inventory", "default_read_body", True),
             max_body_bytes=_getint(parser, "inventory", "default_max_body_bytes", 200000),
             timeout_seconds=_getint(parser, "inventory", "default_timeout_seconds", 10),
-            external_proxy=_getbool(parser, "inventory", "default_external_proxy", True),
+            # FIX: default is False — external runner (GitHub Actions) has no corporate proxy.
+            external_proxy=_getbool(parser, "inventory", "default_external_proxy", False),
             internal_proxy=_getbool(parser, "inventory", "default_internal_proxy", False),
             ingress_proxy=_getbool(parser, "inventory", "default_ingress_proxy", False),
             external_runner=_getstr(parser, "inventory", "default_external_runner", "ExternalRunner"),
@@ -172,7 +173,7 @@ class Cfg:
         c.github_download_timeout_seconds = _getint(parser, "github", "artifact_download_timeout_seconds", 60)
         c.github_api_verify_ssl = _getbool(parser, "github", "api_verify_ssl", False)
 
-        # Proxy settings.
+        # Proxy settings (corporate proxy — for internal checks and GitHub API only).
         proxies: dict = {}
         http_proxy = _getstr(parser, "proxy", "http", "")
         https_proxy = _getstr(parser, "proxy", "https", "")
@@ -203,13 +204,27 @@ class Cfg:
             "external_action": self.external_action,
             "user_agent": self.user_agent,
             "external_timezone": self.external_timezone,
+            # Deliberately no proxy key: GitHub Actions has no corporate proxy.
         }
 
 
 # ─── GitHub Actions dispatch ───────────────────────────────────────────────────
 
 def _serialize(targets: Iterable[CheckTarget]) -> List[dict]:
-    return [dataclasses.asdict(t) for t in targets]
+    """
+    Serialize targets for dispatch to GitHub Actions.
+
+    FIX: force use_proxy=False on every external target before serialising.
+    The GitHub Actions runner is outside the corporate network and has no
+    access to the corporate proxy. Even if a row in Excel accidentally has
+    external_proxy=TRUE, we must not send the corporate proxy to the runner.
+    """
+    result = []
+    for t in targets:
+        d = dataclasses.asdict(t)
+        d["use_proxy"] = False   # ← safety: external runner never uses corporate proxy
+        result.append(d)
+    return result
 
 
 def trigger_dispatch(cfg: Cfg, targets: List[CheckTarget]) -> None:
@@ -402,6 +417,7 @@ def main(
     elif external and cfg.dispatch_external:
         print("⚠️  No complete GitHub config/token; running external targets locally instead.")
 
+    # Internal checks always use the corporate proxy (if configured per target).
     proxies = cfg.proxies or None
     run_internal(
         internal,
@@ -426,12 +442,15 @@ def main(
         except Exception as e:
             print(f"⚠️  Could not fetch/delete external artifact: {e}")
     else:
+        # FIX: external fallback (local run) also passes proxies=None.
+        # Even when running locally, external targets are public URLs that
+        # must NOT go through the corporate proxy.
         from modules.external_url_monitor import run_external
         run_external(
             external,
             log_dir=cfg.external_log_dir,
             concurrency=cfg.external_concurrency,
-            proxies=None,
+            proxies=None,   # ← never use corporate proxy for external targets
             verify_ssl=cfg.external_verify_ssl,
             application=cfg.external_application,
             action=cfg.external_action,
