@@ -102,10 +102,26 @@ def _fmt_elapsed(start: datetime, end: datetime) -> str:
 
 
 def _normalize_url(raw: str) -> str:
+    """
+    Normalize URL for checking.
+
+    Important:
+    - Add https:// when scheme is missing.
+    - Lowercase only scheme + hostname.
+    - Preserve path/query case, because paths can be case-sensitive.
+    """
     u = (raw or "").strip()
+    if not u:
+        return u
+
     if not u.startswith(("http://", "https://")):
         u = "https://" + u
-    return u
+
+    parts = urlsplit(u)
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+
+    return urlunsplit((scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 def _strip_url_scheme(url: str) -> str:
