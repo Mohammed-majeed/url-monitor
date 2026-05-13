@@ -30,9 +30,15 @@ jobs:
 
       - name: Run external URL checks
         run: |
-          printf '%s' "$TARGETS_JSON" | python -m modules.external_url_monitor --targets-stdin
-        env:
-          TARGETS_JSON: ${{ toJson(github.event.client_payload) }}
+          python - <<'PY' | python -m modules.external_url_monitor --targets-stdin
+          import json
+          import os
+
+          with open(os.environ["GITHUB_EVENT_PATH"], "r", encoding="utf-8") as f:
+              event = json.load(f)
+
+          print(json.dumps(event["client_payload"], ensure_ascii=False))
+          PY
 
       - name: Upload external URL monitor logs
         uses: actions/upload-artifact@v4
